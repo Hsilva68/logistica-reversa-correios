@@ -1,0 +1,17 @@
+# Credenciais e configuração local do clasp
+.clasp.json
+.clasprc.json
+.env
+*.env
+*secret*
+*token*
+
+# Ferramentas
+node_modules/
+.vscode/
+.idea/
+
+# Sistema operacional
+Thumbs.db
+desktop.ini
+.DS_Store

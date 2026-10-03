@@ -1,0 +1,421 @@
+{
+  "name": "Monitorar autorizações vencidas - Logística Reversa",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## MONITOR DE AUTORIZAÇÕES VENCIDAS\n\nExecuta diariamente às 09:00 (horário de São Paulo). Lê a aba Reverso, identifica autorizações cuja data em Vencimento da Autorização já passou e cujo Status Recebimento ainda não é Devolvido.\n\nEnvia uma mensagem direta ao solicitante pelo ID Slack registrado na linha e atualiza Última cobrança. A mesma autorização recebe no máximo uma cobrança por dia, até que o status seja alterado para Devolvido.\n\n### Correções aplicadas (v3)\n1. Leitura de data robusta (texto DD/MM/AAAA, AAAA-MM-DD, número de série do Sheets, objeto Date).\n2. Linhas sem Código de Autorização ou ID Slack são puladas sem quebrar o fluxo.\n3. Node 'Filtrar - Envio confirmado' só libera a atualização da planilha quando o Slack confirma o envio (ok=true) — 'Convert types where required' habilitado para evitar o erro de tipo boolean/string.\n4. A atualização de 'Última cobrança' agora casa pela coluna interna row_number (em vez do Código de Autorização), evitando marcar a linha errada quando há códigos de autorização duplicados na planilha.\n5. Mensagem do Slack reestruturada em campos (Colaborador, Matrícula, Autorização, Vencimento + dias em atraso, Status, Equipamento) com botão de acesso direto à planilha.\n6. Lembre-se de ativar o workflow (toggle 'Active') para o Schedule Trigger rodar.\n\n### Correção (v4)\n7. Ajuste de -1 no row_number: o node de leitura estava devolvendo a linha 1 acima da linha real da planilha (ex.: linha real 16, row_number lido como 17), fazendo a atualização de Última cobrança cair na linha errada. Se depois de testar o desvio for diferente de 1, ajuste o valor '- 1' no código do node 'Preparar lembretes vencidos'.\n\n### Correção (v5) — causa raiz real do desvio de linha\n8. A operação do node 'Google Sheets - Registrar cobrança' estava como 'appendOrUpdate', que faz uma BUSCA pelo valor de matching dentro do conteúdo da planilha. Como row_number não é um dado escrito em nenhuma célula (é só um ponteiro interno do n8n), a busca nunca encontrava correspondência e o node sempre criava uma linha nova no fim da planilha (por isso a linha de destino ia subindo a cada execução: 17, depois 18...). Troquei a operação para 'update', que usa row_number para escrever direto na linha certa, sem busca. O ajuste manual de -1 aplicado na v4 foi revertido, pois não era a causa real.\n\n**Antes de testar de novo:** apague manualmente na planilha as linhas extras que foram criadas por engano nos testes anteriores (17 e 18, e a coluna 'row_number' que pode ter sido criada à direita), senão elas ficam poluindo a planilha.\n\n### Ajuste (v6)\n9. Mensagem do Slack com emojis e destaque maior: bloco separado em caixa alta para os dias em atraso logo abaixo do título, divisor visual, e emoji em cada campo (colaborador, matrícula, autorização, status, equipamento) para facilitar a leitura rápida.",
+        "height": 330,
+        "width": 620,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3856,
+        1616
+      ],
+      "id": "b22c9cee-b5fd-4de8-aef3-fe2fe832110b",
+      "name": "LEIA PRIMEIRO"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        3952,
+        2096
+      ],
+      "id": "6629563e-20b7-4dfa-8017-df5d54e36e7b",
+      "name": "Todos os dias às 09:00"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "SEU_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Reverso",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/SEU_SPREADSHEET_ID/edit#gid=0"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        4144,
+        2096
+      ],
+      "id": "3875ad7f-216b-42f2-b203-1d4688cfd043",
+      "name": "Google Sheets - Ler autorizações"
+    },
+    {
+      "parameters": {
+        "jsCode": "const normalize = (value) => String(value || '')\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n  .trim().toLowerCase();\n\nconst dateParts = (date = new Date()) => {\n  const items = new Intl.DateTimeFormat('en-CA', {\n    timeZone: 'America/Sao_Paulo',\n    year: 'numeric', month: '2-digit', day: '2-digit'\n  }).formatToParts(date);\n  const value = Object.fromEntries(items.map(item => [item.type, item.value]));\n  return { key: `${value.year}-${value.month}-${value.day}`, display: `${value.day}/${value.month}/${value.year}` };\n};\n\nconst serialToDate = (serial) => {\n  const base = new Date(Date.UTC(1899, 11, 30));\n  base.setUTCDate(base.getUTCDate() + Math.floor(Number(serial)));\n  return base;\n};\n\nconst parseDate = (raw) => {\n  if (raw === null || raw === undefined || raw === '') return null;\n\n  if (raw instanceof Date && !isNaN(raw)) {\n    return dateParts(raw);\n  }\n\n  if (typeof raw === 'number' || /^\\d+(\\.\\d+)?$/.test(String(raw).trim())) {\n    const asNumber = Number(raw);\n    if (asNumber > 20000 && asNumber < 80000) {\n      return dateParts(serialToDate(asNumber));\n    }\n  }\n\n  const text = String(raw).trim();\n\n  let match = text.match(/^(\\d{2})\\/(\\d{2})\\/(\\d{4})$/);\n  if (match) return { key: `${match[3]}-${match[2]}-${match[1]}`, display: text };\n\n  match = text.match(/^(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (match) return { key: `${match[1]}-${match[2]}-${match[3]}`, display: `${match[3]}/${match[2]}/${match[1]}` };\n\n  return null;\n};\n\nconst diffDays = (fromKey, toKey) => {\n  const [fy, fm, fd] = fromKey.split('-').map(Number);\n  const [ty, tm, td] = toKey.split('-').map(Number);\n  const from = Date.UTC(fy, fm - 1, fd);\n  const to = Date.UTC(ty, tm - 1, td);\n  return Math.round((to - from) / 86400000);\n};\n\nconst today = dateParts();\nconst reminders = [];\n\nfor (const item of $input.all()) {\n  const row = item.json;\n\n  const authorization = String(row['Codigo Autorização de Postagem'] || '').trim();\n  const slackUserId = String(row['ID Slack do Solicitante'] || '').trim();\n\n  if (!authorization || !slackUserId) continue;\n\n  const expiration = parseDate(row['Vencimento da Autorização']);\n  const status = normalize(row['Status Recebimento']);\n  const lastReminder = parseDate(row['Última cobrança']);\n\n  const overdue = !!expiration && expiration.key < today.key;\n  const pendingReturn = status !== 'devolvido';\n  const alreadyRemindedToday = lastReminder?.key === today.key;\n\n  if (!overdue || !pendingReturn || alreadyRemindedToday) continue;\n\n  const person = String(row['Nome do Atleta'] || 'colaborador').trim();\n  const matricula = String(row['Matricula'] || '').trim();\n  const currentStatus = String(row['Status Recebimento'] || 'sem status').trim();\n  const modeloAtual = String(row['Modelo Atual'] || '').trim();\n  const novoEquipamento = String(row['Novo Equipamento'] || '').trim();\n  const equipamento = novoEquipamento || modeloAtual || 'não informado';\n  const diasAtraso = diffDays(expiration.key, today.key);\n  const diasLabel = diasAtraso === 1 ? '1 dia em atraso' : `${diasAtraso} dias em atraso`;\n\n  reminders.push({\n    json: {\n      ...row,\n      rowNumber: row.row_number,\n      authorizationCode: authorization,\n      slackUserId,\n      cobrancaEm: today.key,\n      slackBody: {\n        channel: slackUserId,\n        text: `🚨 Autorização ${authorization} de ${person} venceu em ${expiration.display} (${diasLabel}).`,\n        blocks: [\n          {\n            type: 'header',\n            text: { type: 'plain_text', text: '🚨 Autorização de postagem vencida', emoji: true }\n          },\n          {\n            type: 'section',\n            text: {\n              type: 'mrkdwn',\n              text: `⏰ *VENCIDA HÁ ${diasAtraso === 1 ? '1 DIA' : diasAtraso + ' DIAS'}* — venceu em *${expiration.display}*`\n            }\n          },\n          { type: 'divider' },\n          {\n            type: 'section',\n            fields: [\n              { type: 'mrkdwn', text: `👤 *Colaborador*\\n${person}` },\n              { type: 'mrkdwn', text: `🪪 *Matrícula*\\n${matricula || 'não informada'}` },\n              { type: 'mrkdwn', text: `📋 *Autorização*\\n${authorization}` },\n              { type: 'mrkdwn', text: `📦 *Status de recebimento*\\n${currentStatus}` },\n              { type: 'mrkdwn', text: `💻 *Equipamento*\\n${equipamento}` }\n            ]\n          },\n          {\n            type: 'section',\n            text: {\n              type: 'mrkdwn',\n              text: '✅ Verifique a devolução e atualize o *Status Recebimento* na planilha para *Devolvido* assim que o equipamento retornar.\\n📞 Se ele ainda não retornou, entre em contato com o colaborador responsável.'\n            }\n          },\n          {\n            type: 'actions',\n            elements: [\n              {\n                type: 'button',\n                text: { type: 'plain_text', text: '📄 Abrir planilha', emoji: true },\n                url: 'https://docs.google.com/spreadsheets/d/SEU_SPREADSHEET_ID/edit#gid=0'\n              }\n            ]\n          },\n          {\n            type: 'context',\n            elements: [\n              { type: 'mrkdwn', text: `🔔 Lembrete automático • ${today.display}` }\n            ]\n          }\n        ]\n      }\n    }\n  });\n}\n\nreturn reminders;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4448,
+        2096
+      ],
+      "id": "29a5e2c5-1abc-4e9b-aca8-d4b4ff686cd1",
+      "name": "Preparar lembretes vencidos"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackBody) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4720,
+        2096
+      ],
+      "id": "7a18274a-ad9e-4f68-b7d6-9840597201c6",
+      "name": "Slack - Cobrar solicitante"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "SEU_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Reverso",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $('Preparar lembretes vencidos').item.json.rowNumber }}",
+            "Última cobrança": "={{ $('Preparar lembretes vencidos').item.json.cobrancaEm }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Nome do Atleta",
+              "displayName": "Nome do Atleta",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Matricula",
+              "displayName": "Matricula",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Modelo Atual",
+              "displayName": "Modelo Atual",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Serial Number Atual",
+              "displayName": "Serial Number Atual",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Observação",
+              "displayName": "Observação",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Código de Rastreio Envio",
+              "displayName": "Código de Rastreio Envio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Status Envio",
+              "displayName": "Status Envio",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Novo Equipamento",
+              "displayName": "Novo Equipamento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Serial Number Novo",
+              "displayName": "Serial Number Novo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Codigo Autorização de Postagem",
+              "displayName": "Codigo Autorização de Postagem",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Código de Rastreio Recebimento",
+              "displayName": "Código de Rastreio Recebimento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Status Recebimento",
+              "displayName": "Status Recebimento",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Vencimento da Autorização",
+              "displayName": "Vencimento da Autorização",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ID Slack do Solicitante",
+              "displayName": "ID Slack do Solicitante",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Nome do Solicitante Slack",
+              "displayName": "Nome do Solicitante Slack",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Última cobrança",
+              "displayName": "Última cobrança",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5104,
+        2096
+      ],
+      "id": "4d606ae1-0cdc-4e50-85d0-b5aac9051de5",
+      "name": "Google Sheets - Registrar cobrança"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "b2f6f1a0-1111-4a2b-9c3d-000000000001",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        4848,
+        2096
+      ],
+      "id": "b6ec1b67-3dc2-4175-be42-8ead1ed41ad8",
+      "name": "Filtrar - Envio confirmado"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Todos os dias às 09:00": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets - Ler autorizações",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets - Ler autorizações": {
+      "main": [
+        [
+          {
+            "node": "Preparar lembretes vencidos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar lembretes vencidos": {
+      "main": [
+        [
+          {
+            "node": "Slack - Cobrar solicitante",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Cobrar solicitante": {
+      "main": [
+        [
+          {
+            "node": "Filtrar - Envio confirmado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtrar - Envio confirmado": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets - Registrar cobrança",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "nodeGroups": [],
+  "tags": []
+}
